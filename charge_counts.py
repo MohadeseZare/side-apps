@@ -45,8 +45,8 @@ def analyze_data(data):
         ypoints = np.array(df['Value'])
 
         order = 3
-        fs = df_len / 70
-        cutoff = 0.5
+        fs = df_len / 80
+        cutoff = 0.7
         # plt.subplot(2, 1, 1)
         # plt.plot(xpoints, ypoints)
 
@@ -77,8 +77,10 @@ def analyze_data(data):
 
         icl_d, ncl_d = find_cluster(dydt < -0.5, 1)
         downTrigger = xpoints[icl_d]
+        global last_data
+        last_data = data[-1]['data']
         incomplete_end = False
-        if data[-1]['data'] > 50:
+        if last_data > 50:
             incomplete_end = True
             downTrigger = list(downTrigger)
             downTrigger.append(float(df_len - 1))
@@ -269,31 +271,42 @@ def incomplete_end(charges):
     conn.close()
 
 
-def main():
-    device_infos = [
-        {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 1, "type_data": 2},
-        {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 2, "type_data": 2},
-        {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 1, "type_data": 2},
-        {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 2, "type_data": 2},
-        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 1, "type_data": 2},
-        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 2, "type_data": 2},
-        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 3, "type_data": 2},
-        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 4, "type_data": 2},
-        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 5, "type_data": 2}
-    ]
+def check_charge_end_time(charges):
+    if charges:
+        for charge in charges:
+            if charge['charge_start_time'] > charge['charge_end_time']:
+                charge['charge_end_time'] = last_data
 
-    for device_info in device_infos:
-        api_data = fetch_data_from_api(device_info["mac_address"], device_info["pin"], device_info["position"],
-                                       device_info["type_data"])
-        if api_data:
-            data = analyze_data(api_data)
-            charges = charge_count(api_data, data)
-            if charges:
-                incomplete_end(charges)
-                print(json.dumps(charges, indent=4))
-                save_jsons(charges)
-            else:
-                print('no charges exist')
+
+def main():
+    try:
+        device_infos = [
+            {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 1, "type_data": 2},
+            {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 2, "type_data": 2},
+            {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 1, "type_data": 2},
+            {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 2, "type_data": 2},
+            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 1, "type_data": 2},
+            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 2, "type_data": 2},
+            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 3, "type_data": 2},
+            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 4, "type_data": 2},
+            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 5, "type_data": 2}
+        ]
+
+        for device_info in device_infos:
+            api_data = fetch_data_from_api(device_info["mac_address"], device_info["pin"], device_info["position"],
+                                           device_info["type_data"])
+            if api_data:
+                data = analyze_data(api_data)
+                charges = charge_count(api_data, data)
+                if charges:
+                    check_charge_end_time(charges)
+                    incomplete_end(charges)
+                    print(json.dumps(charges, indent=4))
+                    save_jsons(charges)
+                else:
+                    print('no charges exist')
+    except Exception as e:
+        print(e)
 
 
 if __name__ == "__main__":
