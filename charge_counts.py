@@ -3,30 +3,43 @@ import pandas as pd
 import numpy as np
 # import matplotlib.pyplot as plt
 from scipy.signal import butter, lfilter, decimate
-from scipy import signal
 import json
 import psycopg2
 from datetime import datetime, timedelta
-import pytz, time
+import pytz
+import time
+
+
+conn = psycopg2.connect(
+    dbname="gateway",
+    user="gatewayuser",
+    password="gateway123",
+    host="localhost",
+    port=""
+)
+cur = conn.cursor()
+
+TIME_FORMAT_API = "%Y-%m-%d %H:%M:%S%z"
+TIME_FORMAT_DB = "%Y-%m-%dT%H:%M:%S%z"
 
 
 def fetch_data_from_api(mac_address, pin, position, type_data):
     local_tz = pytz.timezone('Etc/UTC')
-    start_time = datetime.now(local_tz)
-    end_time = start_time - timedelta(hours=8)
-    start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
-    end_time_str = end_time.strftime("%Y-%m-%d %H:%M:%S")
-
+    now = datetime.now(local_tz)
+    start_time = now - timedelta(hours=8)
+    end_time = now
+    start_time_str = start_time.strftime(TIME_FORMAT_API)
+    end_time_str = end_time.strftime(TIME_FORMAT_API)
     data = {
-        "start_time": end_time_str,
-        "end_time": start_time_str,
+        "start_time": start_time_str,
+        "end_time": end_time_str,
         "mac_address": mac_address,
         "pin": pin,
         "position": position,
-        "type_data": type_data,
+        "type_data": type_data
     }
 
-    url = 'http://45.139.10.137/gatewaya/gateway/api/getLogs/inPeriod/data/'
+    url = 'http://127.0.0.1:7000/gatewaya/gateway/api/getLogs/inPeriod/data/'
     response = requests.post(url, data=data)
 
     if response.status_code == 200:
@@ -43,10 +56,13 @@ def analyze_data(data):
         df_len = len(df)
         xpoints = np.arange(df_len)
         ypoints = np.array(df['Value'])
-
-        order = 3
-        fs = df_len / 80
-        cutoff = 0.7
+        print(f"df_len: {df_len}")
+        order = 4
+        fs = df_len / 73
+        if fs < 2:
+            fs =+ 2
+        print(fs)
+        cutoff = 1.5
         # plt.subplot(2, 1, 1)
         # plt.plot(xpoints, ypoints)
 
@@ -77,10 +93,10 @@ def analyze_data(data):
 
         icl_d, ncl_d = find_cluster(dydt < -0.5, 1)
         downTrigger = xpoints[icl_d]
-        global last_data
-        last_data = data[-1]['data']
         incomplete_end = False
-        if last_data > 50:
+        global last_data
+        last_data = data[-1]
+        if last_data['data'] > 50:
             incomplete_end = True
             downTrigger = list(downTrigger)
             downTrigger.append(float(df_len - 1))
@@ -91,6 +107,7 @@ def analyze_data(data):
                      }
 
         # plt.show()
+        # print(data_info)
         return data_info
     else:
         return "Invalid data format or empty data."
@@ -132,8 +149,7 @@ def find_cluster(x, xval):
     return i0, clustersize
 
 
-def calculate_time_difference(time1, time2):
-    time_format = "%Y-%m-%dT%H:%M:%SZ"
+def calculate_time_difference(time1, time2, time_format=TIME_FORMAT_DB):
     datetime1 = datetime.strptime(time1, time_format)
     datetime2 = datetime.strptime(time2, time_format)
     time_diff = datetime1 - datetime2
@@ -161,7 +177,7 @@ def charge_count(original_data, processed_data):
         time_differences = [calculate_time_difference(pair[1], pair[0]) for pair in stop_between_charge]
 
         total_time_seconds = sum(time_differences)
-        charge['complete_status'] = total_time_seconds <= 5400
+        charge['complete_status'] = total_time_seconds <= 4800
         charge['stop_between_charge'] = total_time_seconds
         charge['incomplete_end'] = down not in processed_data['downTriggers'] or up not in processed_data['upTriggers']
 
@@ -169,7 +185,6 @@ def charge_count(original_data, processed_data):
             charge['incomplete_end'] = processed_data['incomplete_end']
 
         all_charge.append(charge)
-    print(all_charge)
     return all_charge
 
 
@@ -194,19 +209,11 @@ def calculate_zero_intervals(data):
     return zero_intervals
 
 
+def save_jsons(charges):
+    # print(charge['charge_start_time'])
+    # print(charge['charge_end_time'])
+    for charge in charges:
 
-def save_jsons(data):
-    conn = psycopg2.connect(
-        dbname="gateway",
-        user="gatewayuser",
-        password="gateway123",
-        host="localhost",
-        port=""
-    )
-
-    cur = conn.cursor()
-
-    for charge in data:
         cur.execute(
             "INSERT INTO logs_chargecounts (mac_addr, pin_id, position, type_data_id, charge_start_time, "
             "charge_end_time, incomplete_end, complete_status, stop_between_charge) "
@@ -215,99 +222,468 @@ def save_jsons(data):
              charge['charge_start_time'], charge['charge_end_time'], charge['incomplete_end'],
              charge['complete_status'], charge['stop_between_charge'])
         )
+    conn.commit()
+
+
+def charge_start_time_status(charge):
+    if charge['charge_start_time'] > charge['charge_end_time']:
+        charge['charge_end_time'] = last_data['sendDataTime']
+
+
+def check_charge_period_status(charge):
+    cur.execute(
+        "SELECT * FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND "
+        "pin_id = %s ORDER BY charge_start_time DESC LIMIT 1;",
+        (charge['mac_address'], charge['position'], charge['type_data_id'], charge['pin']))
+    row = cur.fetchone()
+    if row is not None:
+        start_time_of_query = row[3]
+        end_time_of_query = row[4]
+        # print(end_time_of_query)
+        charge_start_time = datetime.fromisoformat(charge['charge_start_time'].replace('Z', '+00:00'))
+        charge_end_time = datetime.fromisoformat(charge['charge_end_time'].replace('Z', '+00:00'))
+        # print(charge_start_time)
+        time_difference = (charge_start_time - end_time_of_query).total_seconds()
+        c = charge
+
+        if time_difference <= 9600:
+            c['charge_start_time'] = start_time_of_query
+            c['charge_end_time'] = charge_end_time
+            complete_time_difference = charge['stop_between_charge'] + row[-3] + time_difference
+            c['stop_between_charge'] = complete_time_difference
+            print(c['charge_end_time'])
+            # end_time = datetime.fromisoformat(c['charge_end_time'].replace('T', ' '))
+            print(c['charge_start_time'])
+            charge_time = c['charge_end_time'] - c['charge_start_time']
+            charge_time = charge_time.total_seconds()
+            if complete_time_difference >= 4800:
+                c['complete_status'] = False
+            else:
+                if charge_time <= 5400:
+                    c['complete_status'] = False
+                else:
+                    c['complete_status'] = True
+            cur.execute("DELETE FROM logs_chargecounts WHERE id = %s;", (row[0],))
+        else:
+            if row[-4] == False:
+                cur.execute("DELETE FROM logs_chargecounts WHERE id = %s;", (row[0],))
+    return charge
+
+
+def difference_start_end(charge):
+    result = calculate_time_difference(charge['charge_end_time'], charge['charge_start_time'])
+    if result < 14400:
+        charge['complete_status'] = False
+
+
+def append_between_charges_together(charges):
+    if charges:
+        print(f"len charges: {len(charges)}")
+        i = 1
+        while i < len(charges) - 1:
+            updated = False  # Flag to track if a charge was updated
+            if not charges[i]['complete_status']:
+                last_charge = charges[i - 1]
+                next_charge = charges[i + 1]
+
+                difference_last = (datetime.strptime(charges[i]['charge_start_time'], TIME_FORMAT_DB) -
+                                   datetime.strptime(last_charge['charge_end_time'], TIME_FORMAT_DB))
+                difference_next = (datetime.strptime(next_charge['charge_start_time'], TIME_FORMAT_DB) -
+                                   datetime.strptime(charges[i]['charge_end_time'], TIME_FORMAT_DB))
+
+                if difference_last < difference_next:
+                    if difference_last.total_seconds() <= 5400:
+                        charges[i]['charge_start_time'] = last_charge['charge_start_time']
+                        complete_stop_between_charge = (last_charge['stop_between_charge'] +
+                                                        charges[i]['stop_between_charge'] +
+                                                        difference_last.total_seconds())
+                        charges[i]['stop_between_charge'] = complete_stop_between_charge
+                        charges[i]['incomplete_end'] = False
+
+                        if (datetime.fromisoformat(str(charges[i]['charge_end_time'])) -
+                            datetime.fromisoformat(str(charges[i]['charge_start_time']))).total_seconds() < 5400:
+                            charges.remove(charges[i])
+                        elif (5400 < (datetime.fromisoformat(str(charges[i]['charge_end_time'])) -
+                                      datetime.fromisoformat(str(charges[i]['charge_start_time']))).total_seconds() <
+                              16200):
+                            charges[i]['complete_status'] = False
+                        else:
+                            if complete_stop_between_charge <= 5400:
+                                charges[i]['complete_status'] = True
+                            else:
+                                charges[i]['complete_status'] = False
+                        charges.remove(last_charge)
+                        updated = True  # Charge was updated
+                    else:
+                        if ((datetime.strptime(charges[i]['charge_end_time'], TIME_FORMAT_DB) -
+                             datetime.strptime(charges[i]["charge_start_time"], TIME_FORMAT_DB)).total_seconds()
+                                >= 5400):
+                            pass
+                        else:
+                            charges.remove(charges[i])
+                elif difference_next < difference_last:
+                    if difference_next.total_seconds() <= 5400:
+                        next_charge['charge_start_time'] = charges[i]['charge_start_time']
+                        complete_stop_between_charge = (charges[i]['stop_between_charge'] +
+                                                        next_charge['stop_between_charge'] +
+                                                        difference_next.total_seconds())
+                        next_charge['stop_between_charge'] = complete_stop_between_charge
+
+                        charge_end_time = datetime.strptime(next_charge['charge_end_time'], TIME_FORMAT_DB)
+                        charge_start_time = datetime.strptime(next_charge['charge_start_time'], TIME_FORMAT_DB)
+                        duration = charge_end_time - charge_start_time
+
+                        if duration < timedelta(seconds=5400):
+                            pass
+                        elif timedelta(seconds=5400) < duration < timedelta(seconds=16200):
+                            next_charge['complete_status'] = False
+                        else:
+                            if complete_stop_between_charge <= 5400:
+                                next_charge['complete_status'] = True
+                            else:
+                                next_charge['complete_status'] = False
+                        charges.remove(charges[i])
+                        updated = True  # Charge was updated
+                    else:
+                        if ((datetime.strptime(charges[i]['charge_end_time'], TIME_FORMAT_DB) -
+                                datetime.strptime(charges[i]["charge_start_time"], TIME_FORMAT_DB)).total_seconds()
+                                <= 5400):
+                            charges.remove(charges[i])
+                        else:
+                            pass
+                    if ((datetime.fromisoformat(str(charges[i - 1]['charge_end_time'])) -
+                            datetime.fromisoformat(str(charges[i - 1]["charge_start_time"]))).total_seconds() <= 5400):
+                        charges.remove(charges[i - 1])
+                    else:
+                        pass
+
+                else:
+                    if (datetime.fromisoformat(str(charges[i - 1]['charge_end_time'])) -
+                            datetime.fromisoformat(str(charges[i - 1]["charge_start_time"]))).total_seconds() <= 5400:
+                        charges.remove(charges[i-1])
+                    if (datetime.fromisoformat(str(charges[i]['charge_end_time'])) -
+                            datetime.fromisoformat(str(charges[i]["charge_start_time"]))).total_seconds() <= 5400:
+                        charges.remove(charges[i])
+
+            if charges[i-1]['complete_status']:
+                if (datetime.fromisoformat(str(charges[i-1]['charge_end_time'])) -
+                        datetime.fromisoformat(str(charges[i-1]["charge_start_time"]))).total_seconds() <= 5400:
+                    charges.remove(charges[i - 1])
+            if updated:
+                i = max(i - 1, 1)  # Ensure i doesn't go below 1
+            else:
+                i += 1  # Move to the next charge
+
+        print(f"len(new_charges): {len(charges)}")
+        return charges
+
+
+def append_start_end_charges_together(charges):
+    charge = charges[0]
+    cur.execute(
+        "SELECT * FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND "
+        "pin_id = %s AND charge_start_time < %s AND charge_end_time < %s ORDER BY charge_end_time DESC LIMIT 2;",
+        (
+            charge['mac_address'],
+            charge['position'],
+            charge['type_data_id'],
+            charge['pin'],
+            charge['charge_start_time'],
+            charge['charge_end_time']
+        )
+    )
+    rows = cur.fetchall()
+
+    if len(rows) < 1:
+        return charges
+
+    between_charge = list(rows[0])
+
+    if len(rows) == 1:
+        last_charge = between_charge
+        end_time_of_last_charge = last_charge[4]
+        start_time_of_between_charge = between_charge[3]
+        end_time_of_between_charge = between_charge[4]
+        difference_between_first_charge = (datetime.strptime(charge['charge_start_time'], TIME_FORMAT_DB) - end_time_of_between_charge)
+
+        if between_charge[-5]:  # incomplete_end
+            start_time = between_charge[3]
+            row_stop_between_charge = between_charge[8]
+            first_charge_stop_between_charge = charge['stop_between_charge']
+            stop_between_charge = row_stop_between_charge + first_charge_stop_between_charge
+            result = True
+            if stop_between_charge >= 5400:
+                result = False
+            charge['charge_start_time'] = str(start_time)
+            charge['incomplete_end'] = False
+            charge['complete_status'] = result
+            charge['stop_between_charge'] = stop_between_charge
+            print(charge)
+            cur.execute(
+                "DELETE FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND pin_id = %s AND incomplete_end = True",
+                (charge['mac_address'], charge['position'], charge['type_data_id'], charge['pin']))
+        else:
+            if difference_between_first_charge.total_seconds() <= 5400:
+                charge['mac_address'] = between_charge[1]  # mac_addr
+                charge['position'] = between_charge[2]  # position
+                charge['charge_start_time'] = between_charge[3]  # charge_start_time
+                charge['charge_end_time'] = charge['charge_end_time']  # charge_end_time
+                charge['incomplete_end'] = between_charge[5]  # incomplete_end
+                stop_between_charge = (between_charge[7] +
+                                       charge['stop_between_charge'] +
+                                       difference_between_first_charge.total_seconds())
+                charge['stop_between_charge'] = stop_between_charge
+                if (charge['charge_end_time'] - charge['charge_start_time']).total_seconds() >= 16200:
+                    if stop_between_charge < 5400:
+                        charge['complete_status'] = True
+                    else:
+                        charge['complete_status'] = False
+                elif 5400 < (charge['charge_end_time'] - charge['charge_start_time']).total_seconds() < 16200:
+                    charge['complete_status'] = False
+                else:
+                    charge['complete_status'] = False
+
+                cur.execute(
+                    "UPDATE logs_chargecounts "
+                    "SET "
+                    "charge_start_time = %s, charge_end_time = %s, "
+                    "incomplete_end = %s, complete_status = %s, "
+                    "stop_between_charge = %s "
+                    "WHERE "
+                    "charge_start_time = %s AND "
+                    "charge_end_time = %s;",
+                    (charge['charge_start_time'], charge['charge_end_time'], charge['incomplete_end'],
+                     charge['complete_status'],
+                     charge['charge_start_time'], charge['charge_end_time'])
+                )
+                cur.execute(
+                    "DELETE FROM logs_chargecounts WHERE id = %s;",
+                    (between_charge[0],)
+                )
+            else:
+                if (not charge['complete_status'] and (datetime.fromisoformat(str(charge['charge_end_time'])) -
+                                                       datetime.fromisoformat(str('charge_start_time'))).total_seconds()
+                                                       < 5400):
+                    cur.execute(
+                        "DELETE FROM logs_chargecounts WHERE id = %s;",
+                        (between_charge[0],)
+                    )
+                else:
+                    pass
+
+    elif len(rows) == 2:
+        last_charge = list(rows[1])
+        end_time_of_last_charge = last_charge[4]
+        start_time_of_between_charge = between_charge[3]
+        end_time_of_between_charge = between_charge[4]
+        difference_last_between = start_time_of_between_charge - end_time_of_last_charge
+        difference_between_first_charge = (datetime.strptime(charge['charge_start_time'], TIME_FORMAT_DB) - end_time_of_between_charge)
+
+        if between_charge[-5]:  # incomplete_end
+            start_time = between_charge[3]
+            row_stop_between_charge = between_charge[7]
+            first_charge_stop_between_charge = charge['stop_between_charge']
+            stop_between_charge = row_stop_between_charge + first_charge_stop_between_charge
+            result = True
+            if stop_between_charge >= 5400:
+                result = False
+            charge['charge_start_time'] = str(start_time)
+            charge['incomplete_end'] = False
+            charge['complete_status'] = result
+            charge['stop_between_charge'] = stop_between_charge
+            print(charge)
+            cur.execute(
+                "DELETE FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND pin_id = %s AND incomplete_end = True",
+                (charge['mac_address'], charge['position'], charge['type_data_id'], charge['pin']))
+            conn.commit()
+
+            # Comparing updated charge with last_charge
+            print(charge['charge_start_time'])
+            print(type(charge['charge_start_time']))
+            print(last_charge[4])
+            print(type(last_charge[4]))
+            if (datetime.fromisoformat(charge['charge_start_time']) -
+               datetime.fromisoformat(str(last_charge[4]))).total_seconds() <= 5400:
+                charge['mac_address'] = last_charge[1]  # mac_addr
+                charge['position'] = last_charge[2]  # position
+                charge['charge_start_time'] = last_charge[3]  # charge_start_time
+                charge['charge_end_time'] = charge['charge_end_time']  # charge_end_time
+                charge['incomplete_end'] = last_charge[5]  # incomplete_end
+                print(charge['charge_start_time'])
+                print(last_charge[4])
+                stop_between_charge = (last_charge[7] +
+                                       charge['stop_between_charge'] +
+                                       (datetime.fromisoformat(str(between_charge[3])) -
+                                        datetime.fromisoformat(str(last_charge[4])))
+                                       .total_seconds())
+                charge['stop_between_charge'] = stop_between_charge
+                if (datetime.fromisoformat(str(charge['charge_end_time'])) -
+                    datetime.fromisoformat(str(charge['charge_start_time']))).total_seconds() >= 16200:
+                    if stop_between_charge < 5400:
+                        charge['complete_status'] = True
+                    else:
+                        charge['complete_status'] = False
+                elif 5400 < (datetime.fromisoformat(str(charge['charge_end_time'])) -
+                             datetime.fromisoformat(str(charge['charge_start_time']))).total_seconds() < 16200:
+                    charge['complete_status'] = False
+                else:
+                    charge['complete_status'] = False
+                print(charge)
+                cur.execute(
+                    "DELETE FROM logs_chargecounts WHERE id = %s;",
+                    (last_charge[0],)
+                )
+            else:
+                if ((datetime.fromisoformat(str(last_charge[4])) - datetime.fromisoformat(str(last_charge[3]))).
+                        total_seconds() <=
+                        5400):
+                    cur.execute(
+                        "DELETE FROM logs_chargecounts WHERE id = %s;",
+                        (last_charge[0],)
+                    )
+                else:
+                    pass
+            conn.commit()
+        else:
+            if difference_last_between <= difference_between_first_charge:
+                if difference_last_between.total_seconds() <= 5400:
+                    print(between_charge)
+                    print(last_charge)
+
+                    between_charge[1] = last_charge[1]  # mac_addr
+                    between_charge[2] = last_charge[2]  # position
+                    between_charge[3] = last_charge[3]  # charge_start_time
+                    between_charge[4] = between_charge[4]  # charge_end_time
+                    between_charge[5] = between_charge[5]  # incomplete_end
+                    stop_between_charge = last_charge[6] + between_charge[6] + difference_last_between.total_seconds()
+                    between_charge[6] = stop_between_charge
+                    if (datetime.fromisoformat(str(between_charge[4])) -
+                            datetime.fromisoformat(str(between_charge[3]))).total_seconds() >= 16200:
+                        if stop_between_charge < 5400:
+                            between_charge[7] = True
+                        else:
+                            between_charge[7] = False
+                    elif 5400 < (datetime.fromisoformat(str(between_charge[4])) -
+                                 datetime.fromisoformat(str(between_charge[3]))).total_seconds() < 16200:
+                        between_charge[7] = False
+                    else:
+                        between_charge[7] = False
+
+                    cur.execute(
+                        "UPDATE logs_chargecounts SET charge_start_time = %s, charge_end_time = %s, "
+                        "incomplete_end = %s, complete_status = %s, stop_between_charge = %s WHERE id = %s;",
+                        (between_charge[3], between_charge[4], between_charge[5], between_charge[7], between_charge[6],
+                         between_charge[0])
+                    )
+
+                    cur.execute(
+                        "DELETE FROM logs_chargecounts WHERE id = %s;",
+                        (last_charge[0],)
+                    )
+                else:
+                    if ((not last_charge[6]) and (datetime.fromisoformat(str(last_charge[4])) -
+                                                  datetime.fromisoformat(str(last_charge[3]))).total_seconds()
+                                                  < 5400):
+                        cur.execute(
+                            "DELETE FROM logs_chargecounts WHERE id = %s;",
+                            (last_charge[0],)
+                        )
+                    if ((not between_charge[6]) and (datetime.fromisoformat(str(between_charge[4])) -
+                                                     datetime.fromisoformat(str(between_charge[3]))).total_seconds()
+                                                     < 5400):
+                        cur.execute(
+                            "DELETE FROM logs_chargecounts WHERE id = %s;",
+                            (between_charge[0],)
+                        )
+            else:
+                if difference_between_first_charge.total_seconds() <= 5400:
+                    charge['mac_address'] = between_charge[1]  # mac_addr
+                    charge['position'] = between_charge[2]  # position
+                    charge['charge_start_time'] = between_charge[3]  # charge_start_time
+                    charge['charge_end_time'] = charge['charge_end_time']  # charge_end_time
+                    charge['incomplete_end'] = between_charge[5]  # incomplete_end
+                    stop_between_charge = (between_charge[6] +
+                                           charge['stop_between_charge'] +
+                                           difference_between_first_charge.total_seconds())
+                    charge['stop_between_charge'] = stop_between_charge
+                    if (datetime.fromisoformat(str(charge['charge_end_time'])) -
+                        datetime.fromisoformat(str(charge['charge_start_time']))).total_seconds() >= 16200:
+                        if stop_between_charge < 5400:
+                            charge['complete_status'] = True
+                        else:
+                            charge['complete_status'] = False
+                    elif 5400 < (datetime.fromisoformat(str(charge['charge_end_time'])) -
+                                 datetime.fromisoformat(str(charge['charge_start_time']))).total_seconds() < 16200:
+                        charge['complete_status'] = False
+                    else:
+                        charge['complete_status'] = False
+                    #
+                    # cur.execute(
+                    #     "UPDATE logs_chargecounts "
+                    #     "SET "
+                    #     "charge_start_time = %s, charge_end_time = %s, "
+                    #     "incomplete_end = %s, complete_status = %s, "
+                    #     "stop_between_charge = %s "
+                    #     "WHERE "
+                    #     "charge_start_time = %s AND "
+                    #     "charge_end_time = %s;",
+                    #     (charge['charge_start_time'], charge['charge_end_time'], charge['incomplete_end'],
+                    #      charge['complete_status'],
+                    #      charge['charge_start_time'], charge['charge_end_time'])
+                    # )
+                    cur.execute(
+                        "DELETE FROM logs_chargecounts WHERE id = %s;",
+                        (between_charge[0],)
+                    )
+                else:
+                    if not charge['complete_status']:
+                        cur.execute(
+                            "DELETE FROM logs_chargecounts WHERE id = %s;",
+                            (between_charge[0],)
+                        )
+                    else:
+                        pass
 
     conn.commit()
-    cur.close()
-
-
-def incomplete_end(charges):
-    first_charge = charges[0]
-    conn = psycopg2.connect(
-        dbname="gateway",
-        user="gatewayuser",
-        password="gateway123",
-        host="localhost"
-    )
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT * FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND pin_id = %s AND incomplete_end = True",
-        (first_charge['mac_address'], first_charge['position'], first_charge['type_data_id'], first_charge['pin']))
-
-    row = cur.fetchone()  # Retrieve the first row
-
-    if row:
-        print(row)
-        start_time = row[3]
-        row_stop_between_charge = row[8]
-        first_charge_stop_between_charge = first_charge['stop_between_charge']
-        stop_between_charge = row_stop_between_charge + first_charge_stop_between_charge
-        result = True
-        if stop_between_charge >= 1800:
-            result = False
-
-        new_first_charge = {
-            'mac_address': first_charge['mac_address'],
-            'pin': first_charge['pin'],
-            'position': first_charge['position'],
-            'type_data_id': first_charge['type_data_id'],
-            'charge_start_time': str(start_time),
-            'charge_end_time': str(first_charge['charge_end_time']),
-            'incomplete_end': False,
-            'complete_status': result,
-            'stop_between_charge': stop_between_charge
-        }
-
-        cur.execute("DELETE FROM logs_chargecounts WHERE mac_addr = %s AND position = %s AND type_data_id = %s AND pin_id = %s AND incomplete_end = True",
-                    (first_charge['mac_address'], first_charge['position'], first_charge['type_data_id'], first_charge['pin']))
-
-        conn.commit()
-
-        charges[0] = new_first_charge
-        return charges
-    else:
-        print("No result found for the query.")
-
-    conn.close()
-
-
-def check_charge_end_time(charges):
-    if charges:
-        for charge in charges:
-            if charge['charge_start_time'] > charge['charge_end_time']:
-                charge['charge_end_time'] = last_data
+    charges[0] = charge
+    return charges
 
 
 def main():
-    try:
-        device_infos = [
-            {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 1, "type_data": 2},
-            {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 2, "type_data": 2},
-            {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 1, "type_data": 2},
-            {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 2, "type_data": 2},
-            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 1, "type_data": 2},
-            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 2, "type_data": 2},
-            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 3, "type_data": 2},
-            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 4, "type_data": 2},
-            {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 5, "type_data": 2}
-        ]
+    device_infos = [
+        {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 1, "type_data": 2},
+        {"mac_address": 'ST:PB:01:01', "pin": 1, "position": 2, "type_data": 2},
+        {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 1, "type_data": 2},
+        {"mac_address": 'ST:PB:01:02', "pin": 1, "position": 2, "type_data": 2},
+        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 1, "type_data": 2},
+        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 2, "type_data": 2},
+        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 3, "type_data": 2},
+        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 4, "type_data": 2},
+        {"mac_address": 'ST:PB:02:01', "pin": 1, "position": 5, "type_data": 2}
+    ]
+    for device_info in device_infos:
+        api_data = fetch_data_from_api(device_info["mac_address"], device_info["pin"], device_info["position"],
+                                       device_info["type_data"])
+        # print(len(api_data))
+        if api_data and (len(api_data) > 100):
+            data = analyze_data(api_data)
+            charges = charge_count(api_data, data)
+            if charges:
+                for charge in charges:
+                    charge_start_time_status(charge)
+                    difference_start_end(charge)
+                    a = json.dumps(charge, indent=4)
+                charges = append_start_end_charges_together(charges)
+                charges = append_between_charges_together(charges)
+                # print(charges)
+                # print(f" chargessssss lennnnnnnn:\n {len(charges)}")
+                # print(f" chargessssss: {charges}")
+                save_jsons(charges)
+            else:
+                print('no charges exist')
 
-        for device_info in device_infos:
-            api_data = fetch_data_from_api(device_info["mac_address"], device_info["pin"], device_info["position"],
-                                           device_info["type_data"])
-            if api_data:
-                data = analyze_data(api_data)
-                charges = charge_count(api_data, data)
-                if charges:
-                    check_charge_end_time(charges)
-                    incomplete_end(charges)
-                    print(json.dumps(charges, indent=4))
-                    save_jsons(charges)
-                else:
-                    print('no charges exist')
-    except Exception as e:
-        print(e)
 
+conn.commit()
 
 if __name__ == "__main__":
     main()
